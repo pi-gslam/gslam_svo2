@@ -1,0 +1,5 @@
+set(SVO2_FOUND TRUE)
+set(SVO2_INCLUDES ${CMAKE_CURRENT_LIST_DIR}/../svo_install_ws/install/include)
+set(SVO2_VERSION 2.0)
+set(LIB_DIR ${CMAKE_CURRENT_LIST_DIR}/../svo_install_ws/install/lib)
+set(SVO2_LIBS ${LIB_DIR}/libsvo.so ${LIB_DIR}/libvikit_cameras.so ${LIB_DIR}/libglog.so.0.3.5)
