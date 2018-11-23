@@ -1,37 +1,39 @@
 #include <GSLAM/core/GSLAM.h>
-#include <GSLAM/core/HashMap.h>
-#include <GSLAM/core/Messenger.h>
+
+#include <opencv2/imgproc.hpp>
+
 #include <ceres/ceres.h>
+
+#include <svo/svo.h>
 #include <svo/common/conversions.h>
 #include <svo/common/imu_calibration.h>
-#include <svo/svo.h>
 #include <svo/tracker/feature_tracking_utils.h>
+
 #include <vikit/params_helper.h>
-#include <opencv2/imgproc.hpp>
-#include <GSLAM/core/Event.h>
+#include <vikit/cameras.h>
+#include <vikit/cameras/camera_geometry.h>
+#include <vikit/cameras/no_distortion.h>
+#include <vikit/cameras/pinhole_projection.h>
+#include <vikit/cameras/radial_tangential_distortion.h>
 
 using namespace svo;
+using namespace vk;
 
 BaseOptions loadBaseOptions(GSLAM::Svar pnh, bool forward_default) {
   BaseOptions o;
-  o.max_n_kfs = pnh.GetInt("max_n_kfs", 5);
-  o.use_imu = pnh.Get<bool>("use_imu", false);
+  o.max_n_kfs = pnh.GetInt("max_n_kfs", 20);
+  o.use_imu = pnh.Get<bool>("use_imu", true);
   o.trace_dir = pnh.GetString("trace_dir", o.trace_dir);
   o.quality_min_fts = pnh.GetInt("quality_min_fts", 50);
   o.quality_max_fts_drop = pnh.GetInt("quality_max_drop_fts", 40);
   o.relocalization_max_trials = pnh.GetInt("relocalization_max_trials", 50);
   o.poseoptim_prior_lambda = pnh.GetDouble("poseoptim_prior_lambda", 0.0);
-  o.poseoptim_using_unit_sphere =
-      pnh.Get<bool>("poseoptim_using_unit_sphere", false);
-  o.img_align_prior_lambda_rot =
-      pnh.GetDouble("img_align_prior_lambda_rot", 0.0);
-  o.img_align_prior_lambda_trans =
-      pnh.GetDouble("img_align_prior_lambda_trans", 0.0);
-  o.structure_optimization_max_pts =
-      pnh.GetInt("structure_optimization_max_pts", 20);
+  o.poseoptim_using_unit_sphere =pnh.Get<bool>("poseoptim_using_unit_sphere", false);
+  o.img_align_prior_lambda_rot =pnh.GetDouble("img_align_prior_lambda_rot", 0.0);
+  o.img_align_prior_lambda_trans =pnh.GetDouble("img_align_prior_lambda_trans", 0.0);
+  o.structure_optimization_max_pts =pnh.GetInt("structure_optimization_max_pts", 20);
   o.init_map_scale = pnh.GetDouble("map_scale", 1.0);
-  std::string default_kf_criterion =
-      forward_default ? "FORWARD" : "DOWNLOOKING";
+  std::string default_kf_criterion =forward_default ? "FORWARD" : "DOWNLOOKING";
   if (pnh.GetString("kfselect_criterion", default_kf_criterion) == "FORWARD")
     o.kfselect_criterion = KeyframeCriterion::FORWARD;
   else
@@ -151,12 +153,19 @@ StereoTriangulationOptions loadStereoOptions(GSLAM::Svar pnh) {
   return o;
 }
 
-ImuHandler::Ptr getImuHandler(GSLAM::Svar pnh) {
-  std::string calib_file = pnh.GetString("calib_file", "");
-  ImuCalibration imu_calib = ImuHandler::loadCalibrationFromFile(calib_file);
+ImuHandler::Ptr getImuHandler(GSLAM::Svar pnh,GSLAM::FramePtr fr) {
+    ImuCalibration imu_calib;
+    GSLAM::Point3d accN,angN;
+    if(fr->getAccelerationNoise(accN)){
+        imu_calib.acc_noise_density=accN.x;
+        imu_calib.acc_bias_random_walk_sigma=accN.y;
+    }
+    if(fr->getAngularVNoise(angN)){
+        imu_calib.gyro_noise_density=angN.x;
+        imu_calib.gyro_bias_random_walk_sigma=angN.y;
+    }
   imu_calib.print("Loaded IMU Calibration");
-  ImuInitialization imu_init =
-      ImuHandler::loadInitializationFromFile(calib_file);
+  ImuInitialization imu_init;
   imu_init.print("Loaded IMU Initialization");
   ImuHandler::Ptr imu_handler(new ImuHandler(imu_calib, imu_init));
   return imu_handler;
@@ -232,53 +241,40 @@ FrameHandlerArray::Ptr makeArray(GSLAM::Svar pnh,
   return vo;
 }
 
-class SVO2 : public GSLAM::SLAM {
+class SVO2 : public GSLAM::Application {
  public:
-  SVO2() {
+  SVO2():GSLAM::Application("SVO2") {
       ros::Time::init();
-      setMap(GSLAM::MapPtr(new GSLAM::HashMap()));
-  }
-
-  virtual bool    setSvar(GSLAM::Svar& var){
-      init(var);
   }
 
   GSLAM::Messenger init(GSLAM::Svar var) {
-    config = var;
     google::InitGoogleLogging(var.GetString("ProgramName", "exe").c_str());
     google::InstallFailureSignalHandler();
+    config = var;
+    config.Arg<int>("max_n_kfs",20,"The maximum keyframe number keep in map.");
+    bool useIMU=config.Arg<bool>("use_imu", true,"Should svo uses imu information.");
+    config.Arg<double>("kfselect_min_dist",0.12,"We select a new KF whenever we move"
+    " kfselect_min_dist of the average depth away from the closest keyframe.");
+    config.Arg<std::string>("kfselect_criterion","DOWNLOOKING","FORWARD or DOWNLOOKING");
 
-
-    if (config.Get<bool>("use_imu", true)) {
-        messenger.subscribe(var.GetString("imu_topic", "imu"), 10,
+    if(useIMU){
+        messenger.subscribe(var.GetString("imu_topic", "imu"), 0,
                             &SVO2::imuCallback, this);
     }
-    messenger.subscribe(var.GetString("imgframe_topic", "images"), 2,
+    messenger.subscribe(var.GetString("imgframe_topic", "images"), 0,
                         &SVO2::imagesCallback, this);
 
-    pub_init_tracks = messenger.advertise<GSLAM::GImage>(type()+"/init_tracks", 1);
-    pub_curframe = messenger.advertise<GSLAM::MapFrame>(type()+"/curframe", 1);
-    pub_map = messenger.advertise<GSLAM::Map>(type()+"/map", 1);
+    pub_init_tracks = messenger.advertise<GSLAM::GImage>(name()+"/init_tracks", 100);
+    pub_curframe = messenger.advertise<GSLAM::MapFrame>(name()+"/curframe", 100);
+    pub_map = messenger.advertise<GSLAM::Map>(name()+"/map", 100);
 
     return messenger;
-  }
-
-  virtual std::string type() const { return "SVO2"; }
-  virtual bool valid() const { return true; }
-  virtual bool isDrawable() const { return false; }
-
-  virtual bool track(GSLAM::FramePtr& frame) {
-    if (frame->cameraNum() == 0)
-      imuCallback(frame);
-    else
-      imagesCallback(frame);
-    return true;
   }
 
   void imuCallback(const GSLAM::FramePtr& imuFrame) {
       if(!imu_handler_)
       {
-          imu_handler_ = getImuHandler(config);
+          imu_handler_ = getImuHandler(config,imuFrame);
       }
     GSLAM::Point3d linear_acceleration, angular_velocity;
     if (!imuFrame->getAcceleration(linear_acceleration)) return;
@@ -324,22 +320,24 @@ class SVO2 : public GSLAM::SLAM {
 
   void imagesCallback(const GSLAM::FramePtr& imgFrame) {
       if(!svo_){
+          CameraBundlePtr cameraBundle=getCameraConfig(imgFrame);
           switch (imgFrame->cameraNum()) {
           case 1:
-              svo_ = makeMono(config);
+              svo_ = makeMono(config,cameraBundle);
               break;
           case 2:
-              svo_ = makeStereo(config);
+              svo_ = makeStereo(config,cameraBundle);
               break;
           default:
-              svo_ = makeArray(config);
+              svo_ = makeArray(config,cameraBundle);
               break;
           }
           svo_->start();
       }
     std::vector<cv::Mat> images;
     for (int i = 0; i < imgFrame->cameraNum(); i++) {
-      images.push_back(imgFrame->getImage(i));
+        GSLAM::GImage gimage=imgFrame->getImage(i);
+      images.push_back(cv::Mat(gimage.rows,gimage.cols,gimage.type(),gimage.data).clone());
     }
 
     setImuPrior(imgFrame->timestamp());
@@ -363,14 +361,14 @@ class SVO2 : public GSLAM::SLAM {
         if (pub_curframe.getNumSubscribers() > 0||true) {
           publishCurrent(imgFrame);
         }
-        if(pub_map.getNumSubscribers()>0||true){
+        if(pub_map.getNumSubscribers()>0){
             publishMap();
         }
         break;
       }
       case Stage::kInitializing: {
-//        if (pub_init_tracks.getNumSubscribers() == 0) break;
-          publishInitTracks(imgFrame);
+        if (pub_init_tracks.getNumSubscribers() == 0) break;
+        publishInitTracks(imgFrame);
         break;
       }
       case Stage::kPaused:
@@ -384,17 +382,13 @@ class SVO2 : public GSLAM::SLAM {
 
   void publishCurrent(const GSLAM::FramePtr& imgFrame){
       auto T_world_imu = svo_->getLastFrames()->get_T_W_B();
-      Eigen::Quaterniond q = T_world_imu.getRotation().toImplementation();
-      Eigen::Vector3d p = T_world_imu.getPosition();
-      GSLAM::SE3 pose(p[0], p[1], p[2], q.x(), q.y(), q.z(), q.w());
-      imgFrame->setPose(pose);
-      std::cerr<<"Frame "<<imgFrame->id()<<":"<<pose;
+      imgFrame->setPose(toGSLAM(T_world_imu));
+      std::cerr<<"Frame "<<imgFrame->id()<<":"<<toGSLAM(T_world_imu)<<std::endl;
       pub_curframe.publish(imgFrame);
-      _handle->handle(new GSLAM::CurrentFrameEvent(imgFrame));
   }
 
   void publishMap(){
-      GSLAM::MapPtr map=getMap();
+      GSLAM::MapPtr map(new GSLAM::HashMap());
       map->clear();
       MapPtr svomap=svo_->map();
       GSLAM::PointID ptid=0;
@@ -402,6 +396,9 @@ class SVO2 : public GSLAM::SLAM {
       {
         const FramePtr& frame = kf.second;
         const Transformation T_w_f = frame->T_world_cam();
+        GSLAM::FramePtr fr(new GSLAM::MapFrame(frame->id(),frame->timestamp_*1e-9));
+        fr->setPose(toGSLAM(T_w_f));
+        map->insertMapFrame(fr);
         for(size_t i = 0; i < frame->num_features_; ++i)
         {
           if(isSeed(frame->type_vec_[i]))
@@ -414,7 +411,7 @@ class SVO2 : public GSLAM::SLAM {
           }
         }
       }
-      _handle->handle(map);
+      pub_map.publish(map);
   }
 
   void publishInitTracks(const GSLAM::FramePtr& imgFrame){
@@ -435,10 +432,51 @@ class SVO2 : public GSLAM::SLAM {
               cv::Scalar(0, 255, 0, 0), 2);
         }
         pub_init_tracks.publish(GSLAM::GImage(img));
-        _handle->handle(new GSLAM::DebugImageEvent(img,"init_tracks"));
         LOG(INFO)<<"Initializing ...";
         break;
       }
+  }
+
+  GSLAM::SE3 toGSLAM(Transformation T){
+      auto p=T.getPosition();
+      auto q=T.getRotation().toImplementation();
+      return GSLAM::SE3(p[0], p[1], p[2], q.x(), q.y(), q.z(), q.w());
+  }
+
+  Transformation toSVO(GSLAM::SE3 pose){
+      auto r=pose.get_rotation();
+      auto t=pose.get_translation();
+      return Transformation(Eigen::Quaterniond(r.w,r.x,r.y,r.z),
+                            Position(t.x,t.y,t.z));
+  }
+
+  CameraBundlePtr getCameraConfig(const GSLAM::FramePtr& imgFrame)
+  {
+      TransformationVector T_C_B;
+      std::vector<std::shared_ptr<Camera>> cameras;
+      for(int i=0;i<imgFrame->cameraNum();i++){
+          T_C_B.push_back(toSVO(imgFrame->getCameraPose(i).inverse()));
+          GSLAM::Camera camera=imgFrame->getCamera(i);
+          std::vector<double> p=camera.getParameters();
+          if(camera.CameraType()=="PinHole"){
+              std::shared_ptr<Camera> cam(new vk::cameras::PinholeGeometry(p[0],p[1],
+                      vk::cameras::PinholeProjection<vk::cameras::NoDistortion>(p[2],p[3],p[4],p[5],
+                      vk::cameras::NoDistortion())));
+              cameras.push_back(cam);
+          }
+          else if(camera.CameraType()=="OpenCV"){
+              std::shared_ptr<Camera> cam(new vk::cameras::PinholeRadTanGeometry(p[0],p[1],
+                      vk::cameras::PinholeProjection<vk::cameras::RadialTangentialDistortion>(p[2],p[3],p[4],p[5],
+                      vk::cameras::RadialTangentialDistortion(p[6],p[7],p[8],p[9]))));
+              cameras.push_back(cam);
+          }
+      }
+      assert(cameras.size()==T_C_B.size());
+      CameraBundlePtr ncam(new CameraBundle(T_C_B,cameras,""));
+      std::cout << "loaded " << ncam->numCameras() << " cameras";
+      for (const auto& cam : ncam->getCameraVector())
+        cam->printParameters(std::cout, "");
+      return ncam;
   }
 
   // These functions are called before and after monoCallback or stereoCallback.
@@ -453,4 +491,4 @@ class SVO2 : public GSLAM::SLAM {
   GSLAM::Publisher pub_init_tracks, pub_curframe, pub_map;
 };
 
-USE_GSLAM_PLUGIN(SVO2);
+REGISTER_APPLICATION(SVO2);
