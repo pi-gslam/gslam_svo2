@@ -1,4 +1,5 @@
 #include <GSLAM/core/GSLAM.h>
+#include <GSLAM/core/HashMap.h>
 
 #include <opencv2/imgproc.hpp>
 
@@ -241,34 +242,33 @@ FrameHandlerArray::Ptr makeArray(GSLAM::Svar pnh,
   return vo;
 }
 
-class SVO2 : public GSLAM::Application {
+class SVO2  {
  public:
-  SVO2():GSLAM::Application("SVO2") {
+  SVO2(){
       ros::Time::init();
   }
 
-  GSLAM::Messenger init(GSLAM::Svar var) {
+  void init(GSLAM::Svar var) {
     google::InitGoogleLogging(var.GetString("ProgramName", "exe").c_str());
     google::InstallFailureSignalHandler();
     config = var;
-    config.Arg<int>("max_n_kfs",20,"The maximum keyframe number keep in map.");
-    bool useIMU=config.Arg<bool>("use_imu", true,"Should svo uses imu information.");
-    config.Arg<double>("kfselect_min_dist",0.12,"We select a new KF whenever we move"
+    config.arg<int>("max_n_kfs",20,"The maximum keyframe number keep in map.");
+    bool useIMU=config.arg<bool>("use_imu", true,"Should svo uses imu information.");
+    config.arg<double>("kfselect_min_dist",0.12,"We select a new KF whenever we move"
     " kfselect_min_dist of the average depth away from the closest keyframe.");
-    config.Arg<std::string>("kfselect_criterion","DOWNLOOKING","FORWARD or DOWNLOOKING");
+    config.arg<std::string>("kfselect_criterion","DOWNLOOKING","FORWARD or DOWNLOOKING");
 
-    if(useIMU){
-        messenger.subscribe(var.GetString("imu_topic", "imu"), 0,
-                            &SVO2::imuCallback, this);
-    }
-    messenger.subscribe(var.GetString("imgframe_topic", "images"), 0,
-                        &SVO2::imagesCallback, this);
+    subDataset=messenger.subscribe("dataset/frame",50,[this,useIMU](GSLAM::FramePtr fr){
+        if(fr->cameraNum())
+            this->imagesCallback(fr);
+        else if(useIMU&&fr->getIMUNum())
+            this->imuCallback(fr);
+    });
 
-    pub_init_tracks = messenger.advertise<GSLAM::GImage>(name()+"/init_tracks", 100);
-    pub_curframe = messenger.advertise<GSLAM::MapFrame>(name()+"/curframe", 100);
-    pub_map = messenger.advertise<GSLAM::Map>(name()+"/map", 100);
+    pub_init_tracks = messenger.advertise<GSLAM::GImage>("svo2/init_tracks", 100);
+    pub_curframe = messenger.advertise<GSLAM::MapFrame>("svo2/curframe", 100);
+    pub_map = messenger.advertise<GSLAM::Map>("svo2/map", 100);
 
-    return messenger;
   }
 
   void imuCallback(const GSLAM::FramePtr& imuFrame) {
@@ -484,11 +484,22 @@ class SVO2 : public GSLAM::Application {
   virtual void imageCallbackPreprocessing(double timestamp_nanoseconds) {}
   virtual void imageCallbackPostprocessing() {}
 
-  GSLAM::Messenger messenger;
   GSLAM::Svar config;
   std::shared_ptr<FrameHandlerBase> svo_;
   std::shared_ptr<ImuHandler> imu_handler_;
   GSLAM::Publisher pub_init_tracks, pub_curframe, pub_map;
+  GSLAM::Subscriber subDataset;
 };
 
-REGISTER_APPLICATION(SVO2);
+int runsvo2(GSLAM::Svar config){
+    SVO2 svo2;
+    svo2.init(config);
+
+    if(config.get("help",false)) {
+        config["__usage__"]=messenger.introduction();
+        return config.help();
+    }
+    return GSLAM::Messenger::exec();
+}
+
+GSLAM_REGISTER_APPLICATION(svo2,runsvo2);
