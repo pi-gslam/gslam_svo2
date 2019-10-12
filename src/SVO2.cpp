@@ -266,8 +266,8 @@ class SVO2  {
     });
 
     pub_init_tracks = messenger.advertise<GSLAM::GImage>("svo2/init_tracks", 100);
-    pub_curframe = messenger.advertise<GSLAM::MapFrame>("svo2/curframe", 100);
-    pub_map = messenger.advertise<GSLAM::Map>("svo2/map", 100);
+    pub_curframe = messenger.advertise<GSLAM::FramePtr>("svo2/curframe", 100);
+    pub_map = messenger.advertise<GSLAM::MapPtr>("svo2/map", 100);
 
   }
 
@@ -358,12 +358,8 @@ class SVO2  {
     CHECK_NOTNULL(svo_.get());
     switch (svo_->stage()) {
       case Stage::kTracking: {
-        if (pub_curframe.getNumSubscribers() > 0||true) {
-          publishCurrent(imgFrame);
-        }
-        if(pub_map.getNumSubscribers()>0){
-            publishMap();
-        }
+        publishCurrent(imgFrame);
+        publishMap();
         break;
       }
       case Stage::kInitializing: {
@@ -388,8 +384,7 @@ class SVO2  {
   }
 
   void publishMap(){
-      GSLAM::MapPtr map(new GSLAM::HashMap());
-      map->clear();
+      GSLAM::MapPtr gmap(new GSLAM::HashMap());
       MapPtr svomap=svo_->map();
       GSLAM::PointID ptid=0;
       for(auto kf : svomap->keyframes_)
@@ -398,7 +393,7 @@ class SVO2  {
         const Transformation T_w_f = frame->T_world_cam();
         GSLAM::FramePtr fr(new GSLAM::MapFrame(frame->id(),frame->timestamp_*1e-9));
         fr->setPose(toGSLAM(T_w_f));
-        map->insertMapFrame(fr);
+        gmap->insertMapFrame(fr);
         for(size_t i = 0; i < frame->num_features_; ++i)
         {
           if(isSeed(frame->type_vec_[i]))
@@ -407,11 +402,12 @@ class SVO2  {
             const Vector3d xyz = T_w_f * frame->getSeedPosInFrame(i);
             GSLAM::PointPtr pt(new GSLAM::MapPoint(++ptid,
                              GSLAM::Point3d(xyz[0],xyz[1],xyz[2])));
-            map->insertMapPoint(pt);
+            gmap->insertMapPoint(pt);
           }
         }
       }
-      pub_map.publish(map);
+      pub_map.publish(gmap);
+      std::cerr<<"Published map with "<<gmap->frameNum()<<" frames and "<<gmap->pointNum()<<" mappoints.";
   }
 
   void publishInitTracks(const GSLAM::FramePtr& imgFrame){
